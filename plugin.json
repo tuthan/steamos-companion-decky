@@ -1,0 +1,10 @@
+{
+  "name": "SteamOS Companion",
+  "author": "SteamOS Companion",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["remote", "client", "server", "display", "power"],
+    "description": "Authenticated LAN Client, Server, or Both plugin for SteamOS Companion."
+  }
+}
