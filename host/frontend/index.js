@@ -160,6 +160,7 @@
     check_remote_operation: ["action_id"],
     resend_remote_operation: ["action_id", "acknowledge_earlier_may_have_run"],
     wake_remote: [],
+    client_diagnostics: [],
     rename_remote: ["alias"],
     update_remote_endpoint: ["candidate"],
     forget_remote: ["revoke"],
@@ -1486,6 +1487,7 @@
     const [pendingPairing, setPendingPairing] = React.useState(null);
     const [selectedOutputId, setSelectedOutputId] = React.useState("");
     const [selectedModeId, setSelectedModeId] = React.useState("");
+    const [selectedProfileId, setSelectedProfileId] = React.useState("");
     const [selectedLocalOutputKey, setSelectedLocalOutputKey] = React.useState("");
     const [localOutputOrder, setLocalOutputOrder] = React.useState([]);
     const [remoteOutputOrder, setRemoteOutputOrder] = React.useState([]);
@@ -1954,12 +1956,31 @@
       const remoteSunshineEnabled = status.sunshine?.enabled === true;
       const connection = remote?.connection?.reachable === false ? "Can't reach" : status.protocol_version ? "Connected" : "Checking device…";
       const stale = remote?.last_checked_at && Date.now() - Date.parse(remote.last_checked_at) > 15000;
-      const profile = (remote?.profiles || [])[0];
+      const profiles = remote?.profiles || [];
+      const profile = profiles.find(item => item.id === selectedProfileId) || profiles[0];
+      const wake = client.wake?.remote_host_id === remote?.host_id ? client.wake : null;
+      const wakeSent = wake?.state === "sent";
+      const wakeFailed = wake?.state === "failed";
+      const wakeSentAt = wakeSent && wake.sent_at ? Date.parse(wake.sent_at) : NaN;
+      const checkedAt = remote?.last_checked_at ? Date.parse(remote.last_checked_at) : NaN;
+      const wakeResponseObserved = Number.isFinite(wakeSentAt) && Number.isFinite(checkedAt) && checkedAt >= wakeSentAt && remote?.connection?.reachable === true;
+      const wakeTimedOut = Number.isFinite(wakeSentAt) && now - wakeSentAt >= 30000;
       return React.createElement(PanelSection, {title: "Remote device"},
         React.createElement(PanelSectionRow, {focusKey: "remote.identity"}, React.createElement(Text, null, identityName()), React.createElement(Text, {muted: true}, remote?.endpoint), React.createElement(Text, {live: true}, stale ? `Status is out of date · Last checked ${ageLabel(remote.last_checked_at)}` : `${connection} · Checked ${ageLabel(remote?.last_checked_at)}`)),
         renderActionSummary(),
-        React.createElement(PanelSectionRow, {focusKey: "remote.restore"}, profile ? React.createElement(Text, null, `Saved: ${modeLabel(profile.mode)}`) : React.createElement(Text, null, "No recovery mode saved"), React.createElement(Button, {label: "Restore saved display", disabled: !profile || Boolean(busy), onClick: async () => {if (await ensureAvailable("restore")) void run("remote_restore", {source: "verified", profile_id: profile?.id}, "Restore requested");}, focusKey: "remote.restore"})),
-        React.createElement(PanelSectionRow, {focusKey: "remote.wake"}, React.createElement(Button, {label: "Wake device", disabled: Boolean(busy), onClick: () => void run("wake_remote", {}, "Wake packet sent · Waiting for connection…"), focusKey: "remote.wake"})),
+        React.createElement(PanelSectionRow, {focusKey: "remote.restore"}, profile ? React.createElement(Text, null, `Saved on ${profile.output_id}: ${modeLabel(profile.mode)}`) : React.createElement(Text, null, "No recovery mode saved"), React.createElement(Button, {label: "Restore saved display", disabled: !profile || Boolean(busy), onClick: async () => {if (await ensureAvailable("restore")) void run("remote_restore", {source: "verified", profile_id: profile?.id}, "Restore requested");}, focusKey: "remote.restore"}), profiles.length > 1 && React.createElement(Button, {label: "Choose saved display", onClick: () => navigate("display"), focusKey: "remote.restore.choose"})),
+        React.createElement(PanelSectionRow, {focusKey: "remote.wake"},
+          React.createElement(Button, {
+            label: wakeSent && !wakeTimedOut && !wakeResponseObserved ? "Waiting for connection…" : wake ? "Send another wake packet" : "Wake device",
+            disabled: Boolean(busy) || remote?.wake_target?.available !== true || Boolean(wakeSent && !wakeTimedOut && !wakeResponseObserved),
+            onClick: () => void run("wake_remote", {}, "Wake packet sent · Waiting for connection…"),
+            focusKey: "remote.wake",
+          }),
+          remote?.wake_target?.available !== true && React.createElement(Text, {muted: true}, "Wake is not configured for this device"),
+          wakeFailed && React.createElement(Text, {live: true}, "Couldn't send the wake packet"),
+          wakeSent && React.createElement(Text, {live: true}, "Wake packet sent"),
+          wakeSent && React.createElement(Text, {live: true}, wakeResponseObserved ? "Authenticated device response received" : wakeTimedOut ? "No response yet. Wake depends on the device and network." : "Waiting for an authenticated device response…"),
+          wakeSent && React.createElement(Text, {live: true}, wakeResponseObserved && status.steam_bridge === "ready" ? "Steam ready" : "Steam readiness not confirmed")),
         React.createElement(PanelSectionRow, {focusKey: "remote.display"}, React.createElement(Button, {label: "Display settings (resolution)  >", onClick: () => navigate("display"), focusKey: "remote.display"})),
         React.createElement(PanelSectionRow, {focusKey: "remote.display-order"}, React.createElement(Button, {label: "Gaming Mode display order  >", onClick: () => navigate("remote-display-order"), focusKey: "remote.display-order"})),
         React.createElement(PanelSectionRow, {focusKey: "remote.power"}, React.createElement(Button, {label: "Power options  >", onClick: () => navigate("power"), focusKey: "remote.power"})),
@@ -2011,6 +2032,8 @@
     function renderDisplay() {
       const outputs = remote?.outputs || [];
       const output = displayOutput();
+      const profiles = remote?.profiles || [];
+      const selectedProfile = profiles.find(item => item.id === selectedProfileId) || profiles[0] || null;
       const showNonstandard = client.show_nonstandard_display_modes === true;
       const currentModeId = output?.current_mode_id == null ? "" : String(output.current_mode_id);
       const allModes = output ? [...(output.modes || [])].sort((a, b) => {
@@ -2029,6 +2052,7 @@
         outputs.length > 1 && React.createElement(PanelSectionRow, {focusKey: "display.output-picker"}, React.createElement(Picker, {label: "Output", value: output?.id || "", options: outputs.map(item => ({value: item.id, label: item.name || item.id})), onChange: event => {setSelectedOutputId(event.target.value); setSelectedModeId("");}, focusKey: "display.output-picker"})),
         React.createElement(PanelSectionRow, {focusKey: "display.mode-filter"}, React.createElement(Text, {muted: true}, showNonstandard ? "Showing all advertised resolutions and refresh rates." : hiddenModeCount ? `${hiddenModeCount} non-standard ${hiddenModeCount === 1 ? "mode" : "modes"} hidden. Enable them in Settings.` : "Showing common resolutions and refresh rates. The current mode is always shown.")),
         React.createElement(PanelSectionRow, {focusKey: "display.current"}, React.createElement(Text, null, `Current mode: ${modeLabel(output && modes.find(item => item.id === output.current_mode_id))}`), profile ? React.createElement(Text, {muted: true}, `Saved recovery mode: ${modeLabel(profile.mode)}`) : React.createElement(Text, {muted: true}, "No recovery mode saved")),
+        profiles.length > 0 && React.createElement(PanelSectionRow, {focusKey: "display.saved-profiles"}, React.createElement(Text, null, "Saved recovery displays"), profiles.map(item => React.createElement(SelectableRow, {key: item.id, selected: selectedProfile?.id === item.id, title: `${item.output_id} · ${modeLabel(item.mode)}`, description: "Select a verified recovery mode", onClick: () => setSelectedProfileId(item.id), focusKey: `display.saved.${item.id}`})), React.createElement(Button, {label: "Restore saved display", disabled: Boolean(busy) || !selectedProfile, onClick: async () => {if (await ensureAvailable("restore")) void run("remote_restore", {source: "verified", profile_id: selectedProfile.id}, "Restore requested");}, focusKey: "display.restore"})),
         !modes.length && React.createElement(PanelSectionRow, {focusKey: "display.empty"}, React.createElement(Text, null, allModes.length ? "No common display modes are available. Enable non-standard modes in Settings." : "No display modes are available from the remote device.")),
         modes.map(item => React.createElement(PanelSectionRow, {key: `${output?.id}.${item.id}`, focusKey: `display.mode.${output?.id}.${item.id}`}, React.createElement(SelectableRow, {selected: selected?.id === item.id, title: modeLabel(item), description: item.id === output?.current_mode_id ? "Current" : profile?.mode?.id === item.id ? "Saved" : "Select this mode; selection does not change the display.", onClick: () => setSelectedModeId(item.id), focusKey: `display.mode.${output?.id}.${item.id}`}))),
         React.createElement(PanelSectionRow, {focusKey: "display.preview"}, React.createElement(Button, {label: selected ? `Preview ${modeLabel(selected)}` : "Preview selected mode", disabled: !selected || selected.id === output?.current_mode_id || Boolean(preview) || Boolean(busy), onClick: async () => {if (!(await ensureAvailable("preview", {output_id: output.id, mode_id: selected.id}))) return; const value = await run("remote_preview", {output_id: output.id, mode_id: selected.id, generation: output.generation}, "Applying preview…"); if (value) await loadSettings();}, focusKey: "display.preview"})),
@@ -2113,14 +2137,22 @@
       const matched = endpoint.match(/^https:\/\/(\[[^\]]+\]|[^:/]+)(?::([0-9]+))?\/?$/i);
       const host = matched ? matched[1].replace(/^\[|\]$/g, "") : "";
       const port = matched && matched[2] ? Number(matched[2]) : 18443;
+      const recentActions = Array.isArray(client.operations) ? [...client.operations].sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || ""))).slice(0, 8) : [];
       return React.createElement(PanelSection, {title: "Connection details"},
         React.createElement(PanelSectionRow, {focusKey: "details.identity"}, React.createElement(Text, null, remote?.alias || remote?.name || remote?.endpoint), React.createElement(Text, {muted: true}, `Host ID: ${remote?.host_id || "unknown"}`), React.createElement(Text, {muted: true}, `Certificate: ${remote?.certificate_fingerprint || "unknown"}`)),
         React.createElement(PanelSectionRow, {focusKey: "details.rename"}, React.createElement(Button, {label: "Rename locally", onClick: () => setModal({kind: "rename"}), focusKey: "details.rename"})),
         React.createElement(PanelSectionRow, {focusKey: "details.find"}, React.createElement(Button, {label: "Find device again", disabled: Boolean(busy), onClick: async () => {const value = await run("check_remote_device", {host, port}); if (value && value.host_id === remote.host_id && value.certificate_fingerprint === remote.certificate_fingerprint) await run("update_remote_endpoint", {candidate: value}, "Address updated"); else if (value) setMessage("Device identity changed · Review and pair again");}, focusKey: "details.find"})),
+        React.createElement(PanelSectionRow, {focusKey: "details.edit-address"}, React.createElement(Button, {label: "Edit address", onClick: () => setModal({kind: "edit-address", host, port: String(port)}), focusKey: "details.edit-address"})),
         React.createElement(PanelSectionRow, {focusKey: "details.pair-again"}, React.createElement(Button, {label: "Pair with another device", onClick: () => navigate("remote-setup"), focusKey: "details.pair-again"})),
-        React.createElement(PanelSectionRow, {focusKey: "details.forget"}, React.createElement(Button, {label: "Remove this pairing", onClick: () => setModal({kind: "forget"}), focusKey: "details.forget", danger: true})),
+        React.createElement(PanelSectionRow, {focusKey: "details.diagnostics"}, React.createElement(Button, {label: "Export sanitized diagnostics", disabled: Boolean(busy), onClick: async () => {const report = await run("client_diagnostics"); if (report) setModal({kind: "diagnostics", text: JSON.stringify(report, null, 2)});}, focusKey: "details.diagnostics"})),
+        React.createElement(PanelSectionRow, {focusKey: "details.history"}, React.createElement(Text, null, "Recent operations"), recentActions.length ? recentActions.map(item => React.createElement(Text, {key: item.id}, `${item.action || "Action"} · ${item.state || "unknown"}`)) : React.createElement(Text, {muted: true}, "No operations recorded")),
+        React.createElement(PanelSectionRow, {focusKey: "details.forget"}, React.createElement(Button, {label: "Remove this pairing", onClick: () => setModal({kind: "remove-choice"}), focusKey: "details.forget", danger: true})),
         modal?.kind === "rename" && React.createElement(ConfirmModal, {title: "Rename locally", body: React.createElement(Field, {label: "Local name", value: remote?.alias || remote?.name || "", onChange: event => setModal({...modal, value: event.target.value}), focusKey: "modal.rename"}), confirmLabel: "Save name", busy: Boolean(busy), onCancel: () => setModal(null), onConfirm: async () => {const value = modal.value || ""; setModal(null); await run("rename_remote", {alias: value}, "Local name saved");}}),
-        modal?.kind === "forget" && React.createElement(ConfirmModal, {title: `Remove access to ${identityName()}?`, body: "Remove access and forget asks the remote server to revoke this credential. Forget on this device only leaves the old client listed on the server.", confirmLabel: "Forget on this device only", busy: Boolean(busy), onCancel: () => setModal(null), onConfirm: async () => {setModal(null); await run("forget_remote", {revoke: false}, "Pairing forgotten on this device"); navigate("remote-setup");}}),
+        modal?.kind === "diagnostics" && React.createElement(PanelSection, {title: "Sanitized diagnostics"}, React.createElement(Text, null, "This report contains bounded status and action facts without saved credentials or pairing secrets."), React.createElement("textarea", {readOnly: true, value: modal.text, rows: 12, style: {width: "100%"}, "aria-label": "Sanitized diagnostics"}), React.createElement(Button, {label: "Copy report", onClick: async () => {try {await navigator.clipboard.writeText(modal.text); setMessage("Sanitized diagnostics copied");} catch (_) {setMessage("Select the report text to copy it manually");}}, focusKey: "diagnostics.copy"}), React.createElement(Button, {label: "Close", onClick: () => setModal(null), focusKey: "diagnostics.close"})),
+        modal?.kind === "edit-address" && React.createElement(ConfirmModal, {title: `Edit address for ${identityName()}`, body: React.createElement("div", null, React.createElement(Field, {label: "Host or IP address", value: modal.host, onChange: event => setModal({...modal, host: event.target.value}), focusKey: "modal.address.host"}), React.createElement(Field, {label: "Port", type: "number", value: modal.port, onChange: event => setModal({...modal, port: event.target.value}), focusKey: "modal.address.port"})), confirmLabel: "Check and save address", busy: Boolean(busy), onCancel: () => setModal(null), onConfirm: async () => {const nextPort = Number(modal.port); if (!modal.host || !Number.isInteger(nextPort) || nextPort < 1 || nextPort > 65535) {setMessage("Enter a valid host and port."); return;} const value = await run("check_remote_device", {host: modal.host, port: nextPort}); if (!value) return; if (value.host_id !== remote.host_id || value.certificate_fingerprint !== remote.certificate_fingerprint) {setMessage("Device identity changed · Address was not saved"); return;} const saved = await run("update_remote_endpoint", {candidate: value}, "Address updated"); if (saved) setModal(null);}}),
+        modal?.kind === "remove-choice" && React.createElement(PanelSection, {title: "Remove this pairing"}, React.createElement(Text, null, "Choose whether to remove access on the host or forget only on this device."), React.createElement(Button, {label: "Cancel", onClick: () => setModal(null), focusKey: "remove.cancel", autoFocus: true}), React.createElement(Button, {label: "Remove access on the host", onClick: () => setModal({kind: "revoke"}), focusKey: "remove.revoke", danger: true}), React.createElement(Button, {label: "Forget on this device only", onClick: () => setModal({kind: "forget"}), focusKey: "remove.forget", danger: true})),
+        modal?.kind === "revoke" && React.createElement(ConfirmModal, {title: `Remove access to ${identityName()} on the host?`, body: "The host will revoke this credential before the local pairing is removed. If the host cannot confirm removal, the pairing stays here.", confirmLabel: "Remove access and forget", busy: Boolean(busy), onCancel: () => setModal(null), onConfirm: async () => {const value = await run("forget_remote", {revoke: true}, "Access removed on host and pairing forgotten"); if (value) {navigate("remote-setup"); setModal(null); setMessage("Access removed on host and pairing forgotten");}}}),
+        modal?.kind === "forget" && React.createElement(ConfirmModal, {title: `Forget ${identityName()} on this device only?`, body: "The host may still list this client. Remove it there if needed.", confirmLabel: "Forget on this device only", busy: Boolean(busy), onCancel: () => setModal(null), onConfirm: async () => {const value = await run("forget_remote", {revoke: false}, "Pairing forgotten on this device"); if (value) {navigate("remote-setup"); setModal(null); setMessage("Pairing forgotten here; the host may still list this client");}}}),
         React.createElement(PanelSectionRow, {focusKey: "details.back"}, React.createElement(Button, {label: "Back", onClick: () => navigate("remote"), focusKey: "details.back"}))
       );
     }
@@ -2573,8 +2605,8 @@
           },
         }),
         roleHasClient(mode) && React.createElement(PanelSection, {title: "Client"},
-          React.createElement(PanelSectionRow, {focusKey: "settings.display-preferences.explanation"}, React.createElement(Text, null, "Display preferences"), React.createElement(Text, {muted: true}, "Keep uncommon resolutions and refresh rates hidden for a shorter, safer mode list.")),
-          React.createElement(PanelSectionRow, {focusKey: "settings.display-preferences.toggle"}, React.createElement(ToggleRow, {label: "Show non-standard display modes", description: "Also show uncommon resolutions and refresh rates. The current mode is always shown.", checked: showNonstandard, disabled: Boolean(busy), onClick: () => void run("update_settings", {changes: {show_nonstandard_display_modes: !showNonstandard}}, showNonstandard ? "Non-standard display modes hidden" : "Non-standard display modes shown"), focusKey: "settings.display-preferences.toggle"}))
+          React.createElement(PanelSectionRow, {focusKey: "settings.display-preferences.explanation"}, React.createElement(Text, null, "Display preferences"), React.createElement(Text, {muted: true}, "All advertised modes are shown by default so uncommon recovery modes remain visible.")),
+          React.createElement(PanelSectionRow, {focusKey: "settings.display-preferences.toggle"}, React.createElement(ToggleRow, {label: "Show non-standard display modes", description: "Show every advertised resolution and refresh rate. The current mode is always shown.", checked: showNonstandard, disabled: Boolean(busy), onClick: () => void run("update_settings", {changes: {show_nonstandard_display_modes: !showNonstandard}}, showNonstandard ? "Non-standard display modes hidden" : "Non-standard display modes shown"), focusKey: "settings.display-preferences.toggle"}))
         ),
         renderUpdates(),
         React.createElement(PanelSection, {title: "Server"},
@@ -2593,7 +2625,7 @@
 
     function renderReplace() {
       const staged = client.staged_remote;
-      return React.createElement(PanelSection, {title: "Replace remote device"}, React.createElement(Text, null, `Use ${staged?.name || staged?.endpoint || "the new device"} instead of ${identityName()}?`), React.createElement(Button, {label: "Use new device", disabled: Boolean(busy), onClick: async () => {await run("use_staged_remote", {use: true}, "Remote device replaced"); navigate("remote");}, focusKey: "replace.use"}), React.createElement(Button, {label: "Cancel", disabled: Boolean(busy), onClick: async () => {await run("use_staged_remote", {use: false}); navigate("remote");}, focusKey: "replace.cancel", autoFocus: true}));
+      return React.createElement(PanelSection, {title: "Replace remote device"}, React.createElement(Text, null, `Use ${staged?.name || staged?.endpoint || "the new device"} instead of ${identityName()}?`), React.createElement(Button, {label: "Use new device", disabled: Boolean(busy), onClick: async () => {const value = await run("use_staged_remote", {use: true}, "Remote device replaced"); if (value) navigate("remote");}, focusKey: "replace.use"}), React.createElement(Button, {label: "Cancel", disabled: Boolean(busy), onClick: async () => {const value = await run("use_staged_remote", {use: false}); if (value) {navigate("remote"); setMessage(value.server_cleanup || "The old device remains selected");}}, focusKey: "replace.cancel", autoFocus: true}));
     }
 
     function renderBody() {

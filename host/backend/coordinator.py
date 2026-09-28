@@ -549,6 +549,9 @@ class DeviceCoordinator:
     def wake_remote(self) -> dict[str, Any]:
         return self._require_client().wake()
 
+    def client_diagnostics(self) -> dict[str, Any]:
+        return self._require_client().diagnostics()
+
     def rename_remote(self, alias: str) -> dict[str, Any]:
         return self._require_client().rename_remote(alias)
 

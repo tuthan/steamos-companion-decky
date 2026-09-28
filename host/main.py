@@ -275,6 +275,9 @@ class Plugin:
     async def wake_remote(self):
         return await _threaded_call("wake_remote", self.service.wake_remote)
 
+    async def client_diagnostics(self):
+        return await _threaded_call("client_diagnostics", self.service.client_diagnostics)
+
     async def rename_remote(self, alias):
         return await _threaded_call("rename_remote", self.service.rename_remote, alias)
 

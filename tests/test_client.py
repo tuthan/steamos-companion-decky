@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from host.backend.bridge import BridgeBroker
 from host.backend.client import BoundedWorkQueue, ClientService
@@ -50,6 +51,14 @@ class FakeRemoteCore:
         self.rejected = False
         self.unknown_mutation = False
         self.mutations: list[tuple[str, dict]] = []
+        self.revoke_error = False
+        self.revocations = 0
+
+    def revoke_self(self, request_id):
+        self.revocations += 1
+        if self.revoke_error:
+            raise ClientError("device could not be reached", "network_error")
+        return {"operation": {"state": "succeeded", "outcome": "revoked"}}
 
     def pairing_request(self, nonce, client_id, client_name, scopes, *, pairing_session=None, first_request=False):
         if first_request:
@@ -138,24 +147,131 @@ class FakeRemoteCore:
 
 
 class ClientTests(unittest.TestCase):
-    def test_display_mode_preference_defaults_hidden_and_survives_reload(self):
+    def test_display_mode_preference_defaults_to_all_and_survives_reload(self):
         with tempfile.TemporaryDirectory() as directory:
             service = ClientService(directory)
             try:
-                self.assertFalse(service.public_status()["show_nonstandard_display_modes"])
+                self.assertTrue(service.public_status()["show_nonstandard_display_modes"])
                 with self.assertRaises(ClientError) as invalid:
                     service.set_display_preferences("yes")
                 self.assertEqual(invalid.exception.code, "invalid_display_preferences")
-                enabled = service.set_display_preferences(True)
-                self.assertTrue(enabled["show_nonstandard_display_modes"])
+                hidden = service.set_display_preferences(False)
+                self.assertFalse(hidden["show_nonstandard_display_modes"])
             finally:
                 service.stop()
 
             restored = ClientService(directory)
             try:
-                self.assertTrue(restored.public_status()["show_nonstandard_display_modes"])
+                self.assertFalse(restored.public_status()["show_nonstandard_display_modes"])
             finally:
                 restored.stop()
+
+    def test_upgrade_reveals_modes_hidden_by_old_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ClientService(directory)
+            service.store.mutate(lambda state: state.update(schema_version=1, show_nonstandard_display_modes=False))
+            service.stop()
+            upgraded = ClientService(directory)
+            try:
+                self.assertTrue(upgraded.public_status()["show_nonstandard_display_modes"])
+            finally:
+                upgraded.stop()
+
+    def test_discard_staged_pairing_revokes_new_host_and_keeps_old_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            core = FakeRemoteCore()
+            service = ClientService(directory, core_factory=lambda *args, **kwargs: core)
+            old = {**REMOTE_CANDIDATE, "host_id": "old-host", "token": "old-secret"}
+            staged = {**REMOTE_CANDIDATE, "host_id": "new-host", "token": "new-secret"}
+            service.store.mutate(lambda state: state.update(remote=old, staged_remote=staged))
+            try:
+                result = service.use_staged_remote(False)
+                self.assertEqual(core.revocations, 1)
+                self.assertIn("removed", result["server_cleanup"])
+                self.assertEqual(service.store.get("remote")["token"], "old-secret")
+                self.assertIsNone(service.store.get("staged_remote"))
+
+                core.revoke_error = True
+                service.store.mutate(lambda state: state.__setitem__("staged_remote", staged))
+                result = service.use_staged_remote(False)
+                self.assertIn("Could not confirm", result["server_cleanup"])
+                self.assertEqual(service.store.get("remote")["token"], "old-secret")
+                self.assertIsNone(service.store.get("staged_remote"))
+            finally:
+                service.stop()
+
+    def test_revoke_keeps_local_pairing_until_host_confirms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            core = FakeRemoteCore()
+            service = ClientService(directory, core_factory=lambda *args, **kwargs: core)
+            service.store.mutate(lambda state: state.__setitem__("remote", {**REMOTE_CANDIDATE, "token": "secret"}))
+            try:
+                core.revoke_error = True
+                with self.assertRaises(ClientError):
+                    service.forget_remote(revoke=True)
+                self.assertIsNotNone(service.store.get("remote"))
+                core.revoke_error = False
+                self.assertTrue(service.forget_remote(revoke=True)["revoked"])
+                self.assertIsNone(service.store.get("remote"))
+            finally:
+                service.stop()
+
+    def test_diagnostics_omits_secrets_and_untrusted_error_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ClientService(directory)
+            secret = "seeded-bearer-and-qr-secret"
+            service.store.mutate(lambda state: state.update(
+                remote={**REMOTE_CANDIDATE, "token": secret, "last_error": secret, "name": secret,
+                        "outputs": [{"id": "1"}], "profiles": []},
+                operations={"one": {"action": "restore", "state": "failed", "reason": secret,
+                                    "body": {"token": secret}, "updated_at": "2026-09-28T00:00:00Z"}},
+            ))
+            try:
+                report = service.diagnostics()
+                self.assertEqual(report["display_output_count"], 1)
+                self.assertEqual(report["operations"][0]["action"], "restore")
+                self.assertNotIn(secret, json.dumps(report))
+                self.assertLess(len(json.dumps(report)), 8192)
+            finally:
+                service.stop()
+
+    def test_verified_restore_is_available_only_during_owned_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ClientService(directory)
+            remote = {**REMOTE_CANDIDATE, "token": "secret", "scopes": ["display.control"],
+                      "status": {"capabilities": {"display_rescue": "available"}},
+                      "profiles": [{"id": "saved"}], "preview": {"preview_id": "preview-1"}}
+            preview_action = {"action": "preview", "state": "accepted", "remote_operation_id": "preview-1",
+                              "target": {"host_id": "remote-host"}}
+            service.store.mutate(lambda state: state.update(remote=remote, operations={"one": preview_action}))
+            try:
+                self.assertTrue(service.action_availability("restore")["available"])
+                self.assertFalse(service.action_availability("save_current")["available"])
+                service.store.mutate(lambda state: state["operations"]["one"].__setitem__("remote_operation_id", "other-preview"))
+                self.assertFalse(service.action_availability("restore")["available"])
+            finally:
+                service.stop()
+
+    def test_failed_wake_replaces_the_previous_sent_packet_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ClientService(directory)
+            service.store.mutate(lambda state: state.__setitem__("remote", {
+                **REMOTE_CANDIDATE,
+                "wake_target": {"available": True, "mac": "001122334455"},
+            }))
+            try:
+                with mock.patch("host.backend.client.active_route_ipv4", return_value="192.168.50.10"), mock.patch(
+                    "host.backend.client.send_wake_packet",
+                    side_effect=[{"destinations": ["192.168.50.255"]}, ClientError("packet send failed", "network_error")],
+                ):
+                    self.assertTrue(service.wake()["sent"])
+                    self.assertEqual(service.public_status()["wake"]["state"], "sent")
+                    with self.assertRaises(ClientError):
+                        service.wake()
+                self.assertEqual(service.public_status()["wake"]["state"], "failed")
+                self.assertEqual(service.public_status()["remote"]["wake"]["state"], "failed")
+            finally:
+                service.stop()
 
     def test_bounded_queue_deduplicates_reads_and_settles_rejected_mutations(self):
         queue = BoundedWorkQueue(max_workers=1, max_pending=2)

@@ -39,10 +39,11 @@ from .protocol import ProtocolError, identifier, validate_host, validate_scopes
 from .storage import StateStore
 
 
-CLIENT_SCHEMA_VERSION = 1
+CLIENT_SCHEMA_VERSION = 2
 DEFAULT_CLIENT_SCOPES = ["status.read", "power.control", "display.control"]
 MAX_CLIENT_NAME = 96
 MAX_ACTIONS = 64
+MAX_DIAGNOSTIC_ACTIONS = 8
 MAX_DISCOVERY_SCANS = 8
 MAX_DISPLAY_ORDER_KEYS = 16
 _DISPLAY_ORDER_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:|/-]{0,127}$")
@@ -289,7 +290,7 @@ class ClientService:
             "client_id": opaque_id("client-") ,
             "client_name": default_client_name(),
             "upgrade_notice": False,
-            "show_nonstandard_display_modes": False,
+            "show_nonstandard_display_modes": True,
             "remote": None,
             "staged_remote": None,
             "pending_pairing": None,
@@ -300,8 +301,14 @@ class ClientService:
     def _migrate_state(self) -> None:
         state = self.store.snapshot()
         changed = False
+        previous_schema = state.get("schema_version")
         if state.get("schema_version") != CLIENT_SCHEMA_VERSION:
             state["schema_version"] = CLIENT_SCHEMA_VERSION
+            changed = True
+        if previous_schema == 1 and state.get("show_nonstandard_display_modes") is False:
+            # The old default hid valid recovery modes. Existing users can
+            # explicitly hide them again in Settings after this upgrade.
+            state["show_nonstandard_display_modes"] = True
             changed = True
         if not isinstance(state.get("client_id"), str) or not state.get("client_id"):
             state["client_id"] = opaque_id("client-")
@@ -311,7 +318,7 @@ class ClientService:
         except ClientError:
             state["client_name"] = default_client_name()
             changed = True
-        for key, default in (("setup_complete", False), ("device_mode", None), ("upgrade_notice", False), ("show_nonstandard_display_modes", False), ("remote", None), ("staged_remote", None), ("pending_pairing", None), ("operations", {}), ("wake", None)):
+        for key, default in (("setup_complete", False), ("device_mode", None), ("upgrade_notice", False), ("show_nonstandard_display_modes", True), ("remote", None), ("staged_remote", None), ("pending_pairing", None), ("operations", {}), ("wake", None)):
             if key not in state:
                 state[key] = default
                 changed = True
@@ -423,6 +430,41 @@ class ClientService:
             "operations": [self._public_action(value) for value in state.get("operations", {}).values() if isinstance(value, dict)],
             "last_action": self._latest_action(state.get("operations", {})),
             "wake": _copy(state.get("wake")) if isinstance(state.get("wake"), dict) else None,
+        }
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Allowlisted local facts for copying; never serialize private records."""
+        state = self._state()
+        remote = state.get("remote") if isinstance(state.get("remote"), dict) else {}
+        operations = state.get("operations") if isinstance(state.get("operations"), dict) else {}
+        allowed_actions = {
+            "suspend", "restart", "shutdown", "preview", "confirm", "restore",
+            "confirm_preview", "restore_preview", "save_current", "sunshine_restart",
+            "display_order", "display_order_reset",
+        }
+        allowed_states = {"sending", "accepted", "dispatched", "observed_return", "succeeded", "failed", "unknown"}
+        recent = sorted(
+            (item for item in operations.values() if isinstance(item, dict)),
+            key=lambda item: str(item.get("updated_at", "")),
+            reverse=True,
+        )[:MAX_DIAGNOSTIC_ACTIONS]
+        return {
+            "format": "steamos-companion-decky-diagnostics-v1",
+            "client_schema_version": CLIENT_SCHEMA_VERSION,
+            "device_mode": state.get("device_mode") if state.get("device_mode") in {"client", "server", "both"} else "unset",
+            "remote_paired": bool(remote),
+            "remote_connected": remote.get("connection", {}).get("reachable") is True if isinstance(remote.get("connection"), dict) else False,
+            "display_output_count": min(len(remote.get("outputs", [])), 256) if isinstance(remote.get("outputs"), list) else 0,
+            "saved_profile_count": min(len(remote.get("profiles", [])), 256) if isinstance(remote.get("profiles"), list) else 0,
+            "staged_pairing_present": isinstance(state.get("staged_remote"), dict),
+            "operations": [
+                {
+                    "action": item.get("action") if isinstance(item.get("action"), str) and item.get("action") in allowed_actions else "other",
+                    "state": item.get("state") if isinstance(item.get("state"), str) and item.get("state") in allowed_states else "unknown",
+                    "host_operation_id_known": isinstance(item.get("remote_operation_id"), str),
+                }
+                for item in recent
+            ],
         }
 
     @staticmethod
@@ -839,8 +881,16 @@ class ClientService:
         if use:
             self.store.mutate(lambda state: (state.__setitem__("remote", state.get("staged_remote")), state.__setitem__("staged_remote", None)))
             return {"used": True, "remote": self._public_remote(self._state().get("remote")), "old_remote": self._public_remote(old)}
+        cleanup = "The new device removed this client."
+        try:
+            response = self._core(staged).revoke_self(opaque_id("revoke-"))
+            operation = response.get("operation") if isinstance(response, dict) else None
+            if not isinstance(operation, dict) or operation.get("state") != "succeeded":
+                cleanup = "Removal on the new device was not confirmed; remove this client there if it remains listed."
+        except Exception:
+            cleanup = "Could not confirm removal on the new device; remove this client there if it remains listed."
         self.store.mutate(lambda state: state.__setitem__("staged_remote", None))
-        return {"used": False, "remote": self._public_remote(old), "server_cleanup": "The new device may still list this client; remove it there if needed."}
+        return {"used": False, "remote": self._public_remote(old), "server_cleanup": cleanup}
 
     def _mark_pending_error(self, pending_id: str, error: BaseException) -> None:
         if isinstance(error, IdentityMismatch):
@@ -1057,14 +1107,26 @@ class ClientService:
             return {"available": False, "reason": "There is no active display preview to confirm"}
         if action == "restore_preview" and not remote.get("preview"):
             return {"available": False, "reason": "There is no active display preview to revert"}
+        preview = remote.get("preview") if isinstance(remote.get("preview"), dict) else None
+        owns_preview = bool(preview and any(
+            isinstance(value, dict)
+            and value.get("action") == "preview"
+            and value.get("remote_operation_id") == preview.get("preview_id")
+            and value.get("target", {}).get("host_id") == remote.get("host_id")
+            for value in state.get("operations", {}).values()
+        ))
+        if preview and action in {"restore", "restore_preview", "confirm"} and not owns_preview:
+            return {"available": False, "reason": "This display preview belongs to another client"}
         for value in state.get("operations", {}).values():
             if not isinstance(value, dict) or value.get("state") not in {"sending", "accepted", "dispatched"}:
                 continue
-            # Confirm/revert are the two safe exits from an active display
-            # preview. All other mutations must wait for the operation lane.
-            if action not in {"confirm", "restore_preview"} or value.get("action") not in {"preview", "restore_preview", "confirm_preview"}:
+            # Only the owner can confirm or restore while its own preview
+            # occupies the mutation lane. A verified profile is a distinct
+            # recovery target from the preview baseline.
+            recovery_exit = action in {"confirm", "restore_preview", "restore"} and owns_preview and value.get("action") == "preview" and value.get("remote_operation_id") == preview.get("preview_id")
+            if not recovery_exit:
                 return {"available": False, "reason": "Another operation is in progress on the remote device", "operation_id": value.get("id")}
-        if remote.get("preview") and action not in {"confirm", "restore_preview"}:
+        if preview and action not in {"confirm", "restore_preview", "restore"}:
             return {"available": False, "reason": "Another display preview is in progress on the remote device"}
         if action == "preview":
             outputs = remote.get("outputs") or []
@@ -1345,7 +1407,9 @@ class ClientService:
         try:
             result = send_wake_packet(str(target["mac"]), source_address=active_route_ipv4())
         except ClientError as exc:
-            self._update_remote(remote, {"wake": {"state": "failed", "reason": str(exc), "at": _utc_now()}})
+            failure = {"state": "failed", "reason": _safe_text(exc), "at": _utc_now()}
+            self._update_remote(remote, {"wake": failure})
+            self.store.mutate(lambda state: state.__setitem__("wake", {"remote_host_id": remote["host_id"], **failure}))
             raise
         wake = {"state": "sent", "sent_at": _utc_now(), **result}
         self._update_remote(remote, {"wake": wake})
@@ -1376,7 +1440,10 @@ class ClientService:
             return {"forgotten": True, "server_may_list_client": False}
         if revoke:
             try:
-                self._core(remote).revoke_self(opaque_id("revoke-"))
+                response = self._core(remote).revoke_self(opaque_id("revoke-"))
+                operation = response.get("operation") if isinstance(response, dict) else None
+                if not isinstance(operation, dict) or operation.get("state") != "succeeded":
+                    raise ClientError("host did not confirm credential removal", "revoke_unconfirmed")
             except ClientError as exc:
                 raise ClientError("Could not remove access on the remote device; the local pairing was kept", "revoke_failed") from exc
         self.store.mutate(lambda state: state.__setitem__("remote", None))
