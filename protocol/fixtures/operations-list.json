@@ -1,0 +1,27 @@
+{
+  "protocol_version": 1,
+  "operations": [
+    {
+      "id": "op-save-current",
+      "request_id": "req-save-current",
+      "state": "succeeded",
+      "kind": "display.save-current",
+      "created_at": "2026-09-25T10:00:00Z",
+      "updated_at": "2026-09-25T10:00:01Z",
+      "outcome": "current_mode_visible_and_read_back",
+      "reason": null,
+      "target": {"profile_id": "profile-example"}
+    },
+    {
+      "id": "op-host-display-selection",
+      "request_id": "internal-display-selection",
+      "state": "succeeded",
+      "kind": "display.selection.preview",
+      "created_at": "2026-09-25T09:59:00Z",
+      "updated_at": "2026-09-25T09:59:16Z",
+      "outcome": "restored_and_read_back",
+      "reason": null,
+      "target": {"output_id": "output-1", "mode": {"width": 1920, "height": 1080, "refresh_hz": 60}}
+    }
+  ]
+}

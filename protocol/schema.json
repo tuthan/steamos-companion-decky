@@ -48,6 +48,7 @@
     "outputs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/output"}},
     "display_order": {"$ref": "#/$defs/display_order"},
     "operation": {"$ref": "#/$defs/operation"},
+    "operations": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/operation"}},
     "pairing_session": {"type": "string", "minLength": 16, "maxLength": 256}
   },
   "$defs": {

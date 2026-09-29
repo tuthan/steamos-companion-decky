@@ -4,6 +4,7 @@ import json
 import base64
 import http
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ from host.backend.identity import ensure_tls_material, read_cpu_temperature
 from host.backend.pairing import decode_payload, derive_pairing_code
 from host.backend.provider import BridgeSunshineProvider, DeckySunshineProcessObserver, ProviderError
 from host.backend.service import HostService, MAX_CLIENTS, MAX_PAIRING_RECORDS, PAIRING_RETENTION_SECONDS
-from host.backend.server import CONNECTION_LIMIT, _ThreadingHTTPServer, _restore_system_http_package_path
+from host.backend.server import CONNECTION_LIMIT, REQUEST_TIMEOUT, _Handler, _ThreadingHTTPServer, _restore_system_http_package_path
 from host.backend.storage import StateError, StateStore
 
 
@@ -322,11 +323,94 @@ class HostTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
+    def test_fabricated_pairing_sessions_do_not_fill_queue_or_get_poll_rate(self):
+        now = [10_000.0]
+        temp = tempfile.TemporaryDirectory()
+        service = HostService(
+            temp.name,
+            bridge=BridgeBroker(),
+            clock=lambda: now[0],
+            monotonic=lambda: now[0],
+        )
+        service._tls = {"ready": True, "fingerprint": "sha256:" + "a" * 64}
+        try:
+            for index in range(13):
+                nonce = base64.urlsafe_b64encode(bytes([index]) * 16).decode().rstrip("=")
+                with self.assertRaises(Exception) as rejected:
+                    service.handle_http("POST", "/v1/pair/request", {}, {
+                        "verification_nonce": nonce,
+                        "pairing_session": "f" * 16,
+                        "client_name": "Rogue client",
+                        "client_id": f"rogue-{index}",
+                        "scopes": ["status.read"],
+                    })
+                if index == 12:
+                    self.assertEqual(rejected.exception.code, "rate_limited")
+            self.assertEqual(service._rate_buckets["pair:direct"][1], 12)
+            self.assertFalse(service.store.get("pairings"))
+
+            now[0] += 60
+            pending = service.handle_http("POST", "/v1/pair/request", {}, {
+                "verification_nonce": VERIFICATION_NONCE,
+                "client_name": "Legitimate client",
+                "client_id": "client-legitimate",
+                "scopes": ["status.read"],
+            })[2]
+            self.assertEqual(pending["state"], "pending")
+            self.assertEqual(len(service.store.get("pairings", {})), 1)
+        finally:
+            service.stop()
+            temp.cleanup()
+
+    def test_approved_pairing_expires_before_credential_delivery(self):
+        now = [10_000.0]
+        temp = tempfile.TemporaryDirectory()
+        service = HostService(temp.name, bridge=BridgeBroker(), clock=lambda: now[0])
+        service._tls = {"ready": True, "fingerprint": "sha256:" + "b" * 64}
+        request = {
+            "verification_nonce": VERIFICATION_NONCE,
+            "client_name": "Expiry client",
+            "client_id": "client-expiry",
+            "scopes": ["status.read"],
+        }
+        try:
+            pending = service.handle_http("POST", "/v1/pair/request", {}, request)[2]
+            pairing_id = pending["pairing_id"]
+            service.approve_pairing(pairing_id)
+            self.assertIn(pairing_id, service._approved_tokens)
+
+            now[0] += 600
+            with self.assertRaises(Exception) as expired:
+                service.handle_http("POST", "/v1/pair/request", {}, request)
+            self.assertEqual(expired.exception.code, "pairing_expired")
+            self.assertEqual(service.store.get("pairings", {})[pairing_id]["status"], "expired")
+            self.assertNotIn(pairing_id, service._approved_tokens)
+        finally:
+            service.stop()
+            temp.cleanup()
+
     def test_http_server_has_bounded_threaded_accept_path(self):
         from socketserver import ThreadingMixIn
 
         self.assertTrue(issubclass(_ThreadingHTTPServer, ThreadingMixIn))
         self.assertEqual(_ThreadingHTTPServer.request_queue_size, CONNECTION_LIMIT)
+
+    def test_http_handler_arms_an_absolute_request_deadline(self):
+        with mock.patch("host.backend.server.BaseHTTPRequestHandler.__init__", return_value=None):
+            with mock.patch("host.backend.server.threading.Timer") as timer_class:
+                _Handler("request", ("127.0.0.1", 1), object())
+        timer_class.assert_called_once()
+        self.assertEqual(timer_class.call_args.args[0], REQUEST_TIMEOUT)
+        timer_class.return_value.start.assert_called_once_with()
+        timer_class.return_value.cancel.assert_called_once_with()
+
+        handler = object.__new__(_Handler)
+        handler.connection = mock.Mock()
+        handler.close_connection = False
+        handler._abort_request()
+        self.assertTrue(handler.close_connection)
+        handler.connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        handler.connection.close.assert_called_once_with()
 
     def test_decky_frozen_http_package_can_reach_system_server_module(self):
         with tempfile.TemporaryDirectory() as root:
@@ -559,6 +643,22 @@ class HostTests(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 service.handle_http("POST", "/v1/power", headers, {"request_id": "same", "action": "restart"})
             self.assertEqual(caught.exception.status, 409)
+        finally:
+            service.stop()
+            temp.cleanup()
+
+    def test_internal_operations_are_pruned_to_the_shared_retention_bound(self):
+        temp, service = self.make_service()
+        try:
+            created = []
+            for index in range(service.journal.MAX_OPERATIONS + 14):
+                operation = service.journal.internal("local.test", {"index": index})
+                created.append(operation["id"])
+                service.journal.update(operation["id"], state="succeeded", outcome="done")
+            operations = service.store.get("operations", {})
+            self.assertEqual(len(operations), service.journal.MAX_OPERATIONS)
+            self.assertNotIn(created[0], operations)
+            self.assertIn(created[-1], operations)
         finally:
             service.stop()
             temp.cleanup()

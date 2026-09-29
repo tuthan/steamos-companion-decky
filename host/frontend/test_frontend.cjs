@@ -89,6 +89,8 @@ function readVarint(bytes, start) {
   let preferredMonitor = "";
   let loaderConnectCalls = 0;
   let legacyPluginCalls = 0;
+  let settingsCalls = 0;
+  let pairingListCalls = 0;
   const updateFetches = [];
   const results = [];
 
@@ -123,11 +125,14 @@ function readVarint(bytes, start) {
   assert.match(source, /Save and restart Gaming Mode/, "the display-order UI must offer a confirmed apply path");
   assert.match(source, /Move up/, "the display order must be controller-reorderable");
   assert.match(source, /remote_display_order_save:\s*\["output_keys", "generation", "restart"\]/, "remote display order must use a fixed backend contract");
+  assert.match(source, /callBackend\("list_pairings"\)/, "the pairing watcher must use the bounded pairing RPC");
   assert.match(source, /local-display-order/, "Client mode must expose a local-only display-order destination");
   assert.match(source, /Changes the remote device only/, "remote display-order UI must identify its target");
   assert.match(source, /paired remote device will not be affected/, "local display-order UI must identify its target");
   const realSetTimeout = setTimeout;
   const fastSetTimeout = (callback, milliseconds, ...args) => realSetTimeout(callback, Math.min(milliseconds, 8), ...args);
+  const realSetInterval = setInterval;
+  const fastPairingSetInterval = (callback, milliseconds, ...args) => realSetInterval(callback, milliseconds === 1000 ? 8 : milliseconds, ...args);
   const factory = vm.runInNewContext(source, {
     window: {
       SteamClient: {System: system, Settings: settings},
@@ -149,12 +154,20 @@ function readVarint(bytes, start) {
             return {
               call(methodName, ...args) {
                 if (methodName === "get_settings") {
+                  settingsCalls++;
                   return Promise.resolve({
                     mode: {effective: "server"},
                     device_mode: "server",
                     settings: {monitor_sunshine: true},
                     diagnostics: {version: "0.5.1"},
                   });
+                }
+                if (methodName === "list_pairings") {
+                  pairingListCalls++;
+                  return Promise.resolve([
+                    {pairing_id: "pair-pending", status: "pending", client_name: "New client"},
+                    {pairing_id: "pair-approved", status: "approved", client_name: "Existing client"},
+                  ]);
                 }
                 if (methodName === "report_bridge_snapshot") {
                   snapshotReported = true;
@@ -191,7 +204,7 @@ function readVarint(bytes, start) {
     console: {info() {}, warn() {}},
     setTimeout: fastSetTimeout,
     clearTimeout,
-    setInterval,
+    setInterval: fastPairingSetInterval,
     clearInterval,
     ArrayBuffer,
     Uint8Array,
@@ -210,6 +223,7 @@ function readVarint(bytes, start) {
     {command_id: "bridge-sunshine-restart", operation_id: "op-sunshine-restart", kind: "sunshine_restart", payload: {}},
   ];
   const plugin = factory({
+    toaster: {toast() {}},
     fetchNoCors: async (url, options = {}) => {
       updateFetches.push({url, options});
       if (url.endsWith("/releases/latest")) {
@@ -258,6 +272,11 @@ function readVarint(bytes, start) {
     },
   });
 
+  await new Promise(resolve => realSetTimeout(resolve, 40));
+  const settingsCallsBeforePairingWatcher = settingsCalls;
+  await new Promise(resolve => realSetTimeout(resolve, 60));
+  assert.ok(pairingListCalls > 0, "the server watcher should poll pairings");
+  assert.equal(settingsCalls, settingsCallsBeforePairingWatcher, "the pairing watcher must not poll full settings");
   await new Promise(resolve => realSetTimeout(resolve, 250));
   assert.equal(plugin.icon.type, "svg", "the plugin should expose a native SVG icon");
   assert.equal(plugin.icon.props["aria-label"], "SteamOS Companion");

@@ -445,7 +445,7 @@ class HostService:
                     break
                 expires_at = _pairing_expiry(value)
                 status = value.get("status")
-                if status in {"created", "pending"} and expires_at <= now:
+                if status in {"created", "pending", "approved"} and expires_at <= now:
                     needs_prune = True
                     break
                 if expires_at <= now - PAIRING_RETENTION_SECONDS:
@@ -456,6 +456,7 @@ class HostService:
 
         with self._pairing_lock:
             removed: list[str] = []
+            expired_tokens: list[str] = []
 
             def mutate(state: dict[str, Any]) -> None:
                 records = state.setdefault("pairings", {})
@@ -465,8 +466,9 @@ class HostService:
                         records.pop(pairing_id, None)
                         continue
                     expires_at = _pairing_expiry(value)
-                    if value.get("status") in {"created", "pending"} and expires_at <= now:
+                    if value.get("status") in {"created", "pending", "approved"} and expires_at <= now:
                         value["status"] = "expired"
+                        expired_tokens.append(pairing_id)
                     if expires_at <= now - PAIRING_RETENTION_SECONDS:
                         removed.append(pairing_id)
                         records.pop(pairing_id, None)
@@ -488,7 +490,7 @@ class HostService:
                         records.pop(pairing_id, None)
 
             self.store.mutate(mutate)
-            for pairing_id in removed:
+            for pairing_id in set(removed).union(expired_tokens):
                 self._approved_tokens.pop(pairing_id, None)
 
     def get_local_status(self) -> dict[str, Any]:
@@ -907,7 +909,7 @@ class HostService:
                 or not hmac.compare_digest(str(channel_binding), client_channel_binding)
             ):
                 raise ApiError("pairing channel verification failed; select the host again and retry", 401, "pairing_channel_mismatch")
-            is_poll = bool(body.get("pairing_session"))
+            is_poll = self._has_valid_pairing_session(body)
             self._enforce_rate_limit("pair:" + (peer_address or "direct"), 120 if is_poll else 12, 60.0)
             return 200, {}, self._handle_pair_request(
                 body,
@@ -938,6 +940,29 @@ class HostService:
         if method == "GET" and path == "/v1/display/order":
             client = self._authenticate(headers, "status.read", peer_address)
             return 200, {}, self.display_order(client["client_id"])
+        if method == "GET" and path == "/v1/operations":
+            client = self._authenticate(headers, None, peer_address)
+            with self.journal.lock:
+                records = self.store.get("operations", {})
+                operations = []
+                for record in records.values():
+                    if not isinstance(record, dict):
+                        continue
+                    owner = record.get("client_id")
+                    kind = record.get("kind")
+                    host_display_record = owner == "host" and isinstance(kind, str) and (
+                        kind.startswith("display.selection.") or kind == "display.preference"
+                    )
+                    if owner == client["client_id"] or host_display_record:
+                        operations.append(self.journal.public(record))
+            operations.sort(
+                key=lambda item: (str(item.get("updated_at", "")), str(item.get("id", ""))),
+                reverse=True,
+            )
+            return 200, {}, {
+                "protocol_version": 1,
+                "operations": operations[:self.journal.MAX_OPERATIONS],
+            }
         if method == "GET" and path.startswith("/v1/operations/"):
             client = self._authenticate(headers, None, peer_address)
             operation_id = identifier(path.rsplit("/", 1)[-1], "operation_id")
@@ -1034,6 +1059,33 @@ class HostService:
             match = (candidate_id, candidate)
         return match
 
+    def _has_valid_pairing_session(self, body: dict[str, Any]) -> bool:
+        """Return whether a supplied session is an active verification poll."""
+        session = body.get("pairing_session")
+        nonce = body.get("verification_nonce")
+        client_id = body.get("client_id")
+        if not all(isinstance(value, str) for value in (session, nonce, client_id)):
+            return False
+        nonce_hash = _hash_secret(nonce)
+        with self._pairing_lock:
+            for candidate in self.store.get("pairings", {}).values():
+                if not isinstance(candidate, dict) or candidate.get("pairing_method") != "verification":
+                    continue
+                if candidate.get("client_id") != client_id:
+                    continue
+                candidate_hash = candidate.get("verification_nonce_hash")
+                expected_hash = candidate.get("pairing_session_hash")
+                if (
+                    isinstance(candidate_hash, str)
+                    and hmac.compare_digest(nonce_hash, candidate_hash)
+                    and isinstance(expected_hash, str)
+                    and candidate.get("status") in {"pending", "approved", "rejected", "cancelled"}
+                    and _pairing_expiry(candidate) > self.clock()
+                    and _constant_time_hash_match(session, expected_hash)
+                ):
+                    return True
+        return False
+
     def _handle_pair_request(
         self,
         body: dict[str, Any],
@@ -1055,6 +1107,8 @@ class HostService:
             if nonce is not None:
                 found = self._find_verification_pairing(client_id, nonce)
                 if found is None:
+                    if pairing_session_value is not None:
+                        raise ApiError("pairing session is invalid", 401, "unauthorized")
                     active_requests = sum(
                         1
                         for candidate in self.store.get("pairings", {}).values()
@@ -1106,8 +1160,9 @@ class HostService:
             pairing = self.store.get("pairings", {}).get(pairing_id)
             if not pairing:
                 raise ApiError("pairing is not available", 404, "pairing_not_found")
-            if pairing.get("status") in {"created", "pending"} and _pairing_expiry(pairing) <= self.clock():
+            if pairing.get("status") in {"created", "pending", "approved"} and _pairing_expiry(pairing) <= self.clock():
                 self.store.mutate(lambda state: self._set_pairing_status(state, pairing_id, "expired"))
+                self._approved_tokens.pop(pairing_id, None)
                 raise ApiError("pairing has expired", 410, "pairing_expired")
             if (
                 not newly_created

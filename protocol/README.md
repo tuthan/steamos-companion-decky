@@ -12,7 +12,10 @@ credentials, or Sunshine Web UI administration.
 Mutations use a client-generated `request_id`. A `202 Accepted` response means
 the host persisted the operation and may still be processing it. Clients query
 `GET /v1/operations/{id}` with the same credential after disconnect instead of
-creating a second request.
+creating a second request. `GET /v1/operations` returns the bounded operation
+list, newest first, for the caller's credential plus host-owned display records
+(`client_id: "host"`); it never includes another remote credential's records.
+Query strings and request bodies are rejected on this route.
 
 Pairing has two bootstrap forms. The normal form is a short authentication
 string (SAS) that is **derived on both sides and never transmitted**. After

@@ -93,23 +93,30 @@ class OperationJournal:
         return None
 
     def internal(self, kind: str, body: dict[str, Any], owner: str = "host") -> dict[str, Any]:
-        operation_id = opaque_id("op-")
-        stamp = iso_timestamp(self.clock())
-        digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        operation = {
-            "id": operation_id,
-            "client_id": owner,
-            "request_id": opaque_id("internal-"),
-            "kind": kind,
-            "body_digest": digest,
-            "state": "accepted",
-            "created_at": stamp,
-            "updated_at": stamp,
-            "outcome": None,
-            "reason": None,
-        }
-        self.store.mutate(lambda state: state.setdefault("operations", {}).__setitem__(operation_id, operation))
-        return self.public(operation)
+        with self.lock:
+            operation_id = opaque_id("op-")
+            stamp = iso_timestamp(self.clock())
+            digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            operation = {
+                "id": operation_id,
+                "client_id": owner,
+                "request_id": opaque_id("internal-"),
+                "kind": kind,
+                "body_digest": digest,
+                "state": "accepted",
+                "created_at": stamp,
+                "updated_at": stamp,
+                "outcome": None,
+                "reason": None,
+            }
+
+            def mutate(state: dict[str, Any]) -> None:
+                operations = state.setdefault("operations", {})
+                operations[operation_id] = operation
+                self._prune_dict(operations)
+
+            self.store.mutate(mutate)
+            return self.public(operation)
 
     def update(self, operation_id: str, **changes: Any) -> dict[str, Any]:
         with self.lock:

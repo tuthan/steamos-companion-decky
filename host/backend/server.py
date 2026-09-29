@@ -51,6 +51,18 @@ TLS_HANDSHAKE_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 10.0
 
 
+def _close_socket(connection: socket.socket) -> None:
+    """Interrupt a blocking read before closing a timed-out connection."""
+    try:
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        connection.close()
+    except OSError:
+        pass
+
+
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -87,6 +99,16 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
     def process_request_thread(self, request, client_address):
         wrapped = None
+        def abort_handshake() -> None:
+            # ``wrap_socket`` may detach the raw socket object, so interrupt
+            # both references when the handshake deadline fires.
+            _close_socket(request)
+            if wrapped is not None:
+                _close_socket(wrapped)
+
+        handshake_timer = threading.Timer(TLS_HANDSHAKE_TIMEOUT, abort_handshake)
+        handshake_timer.daemon = True
+        handshake_timer.start()
         try:
             wrapped = self._ssl_context.wrap_socket(
                 request,
@@ -103,6 +125,7 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
                 pass
         finally:
             self._connection_slots.release()
+            handshake_timer.cancel()
 
 
 class _ThreadingHTTPServerV6(_ThreadingHTTPServer):
@@ -112,6 +135,24 @@ class _ThreadingHTTPServerV6(_ThreadingHTTPServer):
 class _Handler(BaseHTTPRequestHandler):
     server_version = "SteamOSCompanion/1"
     protocol_version = "HTTP/1.0"
+
+    def __init__(self, request, client_address, server):
+        # Socket timeouts only bound an idle read. A separate timer closes the
+        # connection even when a client keeps sending one byte at a time, and
+        # remains armed through the handler's final response flush.
+        self._request_deadline_timer = threading.Timer(REQUEST_TIMEOUT, self._abort_request)
+        self._request_deadline_timer.daemon = True
+        self._request_deadline_timer.start()
+        try:
+            super().__init__(request, client_address, server)
+        finally:
+            self._request_deadline_timer.cancel()
+
+    def _abort_request(self) -> None:
+        self.close_connection = True
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            _close_socket(connection)
 
     @property
     def service(self) -> HostService:
