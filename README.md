@@ -105,8 +105,8 @@ python3 host/build.py   # writes artifacts/steamos-companion-decky-<version>.zip
 Bump the version in `host/package.json`, commit, and push a matching tag:
 
 ```sh
-git tag v0.5.17
-git push origin v0.5.17
+git tag v0.5.18
+git push origin v0.5.18
 ```
 
 The `Release` workflow builds the ZIP and SHA256 file and attaches both to the
