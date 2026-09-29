@@ -1,6 +1,6 @@
 {
   "name": "steamos-companion-host",
-  "version": "0.5.16",
+  "version": "0.5.17",
   "private": true,
   "description": "Decky Client, Server, or Both plugin for SteamOS Companion v1"
 }

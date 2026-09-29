@@ -5,7 +5,7 @@
   'use strict';
 
   const REPO = 'tuthan/steamos-companion-decky';
-  const FALLBACK_TAG = 'v0.5.16';
+  const FALLBACK_TAG = 'v0.5.17';
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ------------------------------------------------------------ release */
